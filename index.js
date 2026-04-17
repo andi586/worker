@@ -27,6 +27,51 @@ const fetchWithTimeout = async (url, options = {}, ms = 10000) => {
 }
 
 async function pollShots() {
+  // Stage 0: Submit Kling tasks for strictly pending shots (status='pending' AND kling_task_id IS NULL)
+  // Idempotency guaranteed: only picks shots that have never been submitted
+  const { data: newPendingShots } = await supabase
+    .from('movie_shots')
+    .select('*')
+    .eq('status', 'pending')
+    .is('kling_task_id', null)
+    .limit(3)
+
+  if (newPendingShots && newPendingShots.length > 0) {
+    console.log('[worker] Stage 0: found', newPendingShots.length, 'new pending shots to submit')
+    for (const shot of newPendingShots) {
+      try {
+        const klingRes = await fetchWithTimeout('https://api.piapi.ai/api/v1/task', {
+          method: 'POST',
+          headers: {
+            'x-api-key': process.env.PIAPI_API_KEY,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            model: 'kling',
+            task_type: 'video_generation',
+            input: {
+              prompt: shot.prompt,
+              duration: 5,
+              aspect_ratio: '9:16'
+            }
+          })
+        }, 15000)
+        const klingData = await klingRes.json()
+        const klingTaskId = klingData?.data?.task_id
+        if (klingTaskId) {
+          await supabase.from('movie_shots')
+            .update({ kling_task_id: klingTaskId, status: 'submitted', updated_at: new Date().toISOString() })
+            .eq('id', shot.id)
+          console.log('[worker] Stage 0: Kling submitted for shot:', shot.shot_index, 'task_id:', klingTaskId)
+        } else {
+          console.warn('[worker] Stage 0: Kling submission returned no task_id for shot:', shot.shot_index, JSON.stringify(klingData).slice(0, 200))
+        }
+      } catch (e) {
+        console.error('[worker] Stage 0: Kling submission error for shot:', shot.shot_index, e.message)
+      }
+    }
+  }
+
   // Stage 1: Submit Kling tasks for pending shots with no kling_task_id
   const { data: pendingShots } = await supabase
     .from('movie_shots')
