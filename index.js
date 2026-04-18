@@ -37,6 +37,8 @@ async function pollShots() {
     .not('audio_url', 'is', null)
     .is('final_shot_url', null)
 
+  console.log('[worker] Face shots to process:', faceShots?.length ?? 0)
+
   for (const shot of faceShots ?? []) {
     try {
       console.log('[worker] Processing face shot with FFmpeg:', shot.shot_index)
@@ -551,3 +553,4 @@ main()
 // redeploy Fri Apr 17 14:54:14 +07 2026
 // v3 Fri Apr 17 15:02:45 +07 2026
 // deploy Sat Apr 18 14:53:54 +07 2026
+// v1776499803
