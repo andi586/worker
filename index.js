@@ -49,7 +49,7 @@ async function pollShots() {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            imageUrl: shot.twin_frame_url,
+            videoUrl: shot.twin_frame_url,
             audioUrl: shot.audio_url
           })
         },
@@ -216,7 +216,7 @@ async function pollShots() {
     for (const shot of shots) {
       const mid = shot.movie_id ?? 'unknown'
       if (!shotsByMovie[mid]) shotsByMovie[mid] = []
-      if (shotsByMovie[mid].length < 3) shotsByMovie[mid].push(shot)
+      if (shotsByMovie[mid].length < 8) shotsByMovie[mid].push(shot)
     }
     const cappedShots = Object.values(shotsByMovie).flat()
 
@@ -291,6 +291,8 @@ async function pollShots() {
         const videoUrl = data?.data?.output?.works?.[0]?.resource?.resource
 
         console.log('[worker] shot', shot.shot_index, 'kling status:', status)
+        console.log('[worker] shot', shot.shot_index, 'kling videoUrl:', videoUrl ? videoUrl.slice(0, 50) : 'NULL')
+        console.log('[worker] kling output:', JSON.stringify(data?.data?.output).slice(0, 200))
 
         if ((status === 'completed' || status === 'success') && videoUrl) {
           await supabase.from('movie_shots')
@@ -307,7 +309,7 @@ async function pollShots() {
     const { data: sceneShots } = await supabase
       .from('movie_shots')
       .select('*')
-      .eq('status', 'processing')
+      .in('status', ['submitted', 'processing'])
       .eq('shot_type', 'scene')
       .not('kling_scene_url', 'is', null)
 
@@ -555,3 +557,5 @@ main()
 // deploy Sat Apr 18 14:53:54 +07 2026
 // v1776499803
 // auto-deploy test Sat Apr 18 16:13:29 +07 2026
+// test Sat Apr 18 16:15:01 +07 2026
+// force Sat Apr 18 19:30:53 +07 2026
