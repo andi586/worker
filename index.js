@@ -27,6 +27,47 @@ const fetchWithTimeout = async (url, options = {}, ms = 10000) => {
 }
 
 async function pollShots() {
+  // Stage: Process face shots that have twin_frame_url + audio_url ready (NO OmniHuman needed)
+  const { data: faceShots } = await supabase
+    .from('movie_shots')
+    .select('*')
+    .eq('shot_type', 'face')
+    .in('status', ['submitted', 'processing', 'failed'])
+    .not('twin_frame_url', 'is', null)
+    .not('audio_url', 'is', null)
+    .is('final_shot_url', null)
+
+  for (const shot of faceShots ?? []) {
+    try {
+      console.log('[worker] Processing face shot with FFmpeg:', shot.shot_index)
+
+      const mergeRes = await fetchWithTimeout(
+        `${RAILWAY_FFMPEG_URL}/merge-audio`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            imageUrl: shot.twin_frame_url,
+            audioUrl: shot.audio_url
+          })
+        },
+        30000
+      )
+
+      const mergeData = await mergeRes.json()
+      console.log('[worker] FFmpeg merge-audio response:', JSON.stringify(mergeData).slice(0, 200))
+
+      if (mergeData.outputUrl) {
+        await supabase.from('movie_shots')
+          .update({ final_shot_url: mergeData.outputUrl, status: 'done' })
+          .eq('id', shot.id)
+        console.log('[worker] Face shot done:', shot.shot_index, mergeData.outputUrl)
+      }
+    } catch (e) {
+      console.error('[worker] Face shot FFmpeg error:', shot.shot_index, e.message)
+    }
+  }
+
   // Stage 0: Submit Kling tasks for strictly pending shots (status='pending' AND kling_task_id IS NULL)
   // Idempotency guaranteed: only picks shots that have never been submitted
   const { data: newPendingShots } = await supabase
@@ -83,6 +124,26 @@ async function pollShots() {
   if (pendingShots && pendingShots.length > 0) {
     console.log('[worker] Stage 1: found', pendingShots.length, 'shots missing kling_task_id')
     for (const shot of pendingShots) {
+      // Check if kling_task_id already exists
+      if (shot.kling_task_id) {
+        console.log('[worker] Shot already has kling_task_id, skipping:', shot.shot_index)
+        continue
+      }
+
+      // Also use atomic lock to prevent race conditions
+      const { data: locked } = await supabase
+        .from('movie_shots')
+        .update({ status: 'submitted' })
+        .eq('id', shot.id)
+        .eq('status', 'pending')
+        .is('kling_task_id', null)
+        .select()
+
+      if (!locked || locked.length === 0) {
+        console.log('[worker] Shot already being processed, skipping:', shot.shot_index)
+        continue
+      }
+
       try {
         const scenePrompt = shot.scene_description || shot.description || shot.scene || 'cinematic empty scene, dramatic lighting, no people, no humans'
         const klingRes = await fetchWithTimeout('https://api.piapi.ai/api/v1/task', {
@@ -159,32 +220,59 @@ async function pollShots() {
 
     console.log('[worker] polling', cappedShots.length, 'shots across', Object.keys(shotsByMovie).length, 'movies')
 
-    // Poll OmniHuman status
+    // Face shots: merge twin frame image + TTS audio via Railway FFmpeg
+    // These have shot_type='face', twin_frame_url set, audio_url set, no omni_task_id
     for (const shot of cappedShots) {
-      if (!shot.omni_task_id) continue
+      if (shot.shot_type !== 'face') continue
+      if (!shot.twin_frame_url || !shot.audio_url) continue
+      if (shot.status !== 'submitted') continue
 
       try {
-        const res = await fetchWithTimeout('https://api.piapi.ai/api/v1/task/' + shot.omni_task_id, {
-          headers: { 'x-api-key': process.env.PIAPI_API_KEY }
-        })
-        const data = await res.json()
-        console.log('[worker] PiAPI raw response:', JSON.stringify(data).slice(0, 500))
-        const status = data?.data?.status
-        const videoUrl = data?.data?.output?.video
+        // Optimistic lock
+        const { data: locked } = await supabase
+          .from('movie_shots')
+          .update({ status: 'merging', updated_at: new Date().toISOString() })
+          .eq('id', shot.id)
+          .eq('status', 'submitted')
+          .select()
 
-        console.log('[worker] shot', shot.shot_index, 'omni status:', status)
+        if (!locked || locked.length === 0) {
+          console.log('[worker] Face shot already being processed, skipping:', shot.shot_index)
+          continue
+        }
 
-        if ((status === 'completed' || status === 'success') && videoUrl) {
+        console.log('[worker] Merging face shot', shot.shot_index, 'via FFmpeg (twin frame + audio)')
+        const mergeRes = await fetchWithTimeout(
+          RAILWAY_FFMPEG_URL + '/merge-audio',
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              videoUrl: shot.twin_frame_url,
+              audioUrl: shot.audio_url
+            })
+          },
+          30000
+        )
+        const mergeData = await mergeRes.json()
+        if (mergeData.outputUrl) {
           await supabase.from('movie_shots')
-            .update({ omni_video_url: videoUrl, status: 'processing', updated_at: new Date().toISOString() })
+            .update({ final_shot_url: mergeData.outputUrl, status: 'done', updated_at: new Date().toISOString() })
             .eq('id', shot.id)
-          await supabase.from('omnihuman_jobs')
-            .update({ status: 'completed', result_video_url: videoUrl })
-            .eq('task_id', shot.omni_task_id)
-          console.log('[worker] OmniHuman done for shot', shot.shot_index)
+          console.log('[worker] Face shot done via FFmpeg:', shot.shot_index)
+        } else {
+          console.error('[worker] FFmpeg merge-audio no outputUrl for face shot:', JSON.stringify(mergeData))
+          const newRetryCount = (shot.retry_count ?? 0) + 1
+          await supabase.from('movie_shots')
+            .update({ status: newRetryCount >= MAX_RETRIES ? 'failed' : 'submitted', retry_count: newRetryCount, updated_at: new Date().toISOString() })
+            .eq('id', shot.id)
         }
       } catch (e) {
-        console.error('[worker] error polling shot', shot.id, e.message)
+        console.error('[worker] Face shot FFmpeg merge error:', shot.shot_index, e.message)
+        const newRetryCount = (shot.retry_count ?? 0) + 1
+        await supabase.from('movie_shots')
+          .update({ status: newRetryCount >= MAX_RETRIES ? 'failed' : 'submitted', retry_count: newRetryCount, updated_at: new Date().toISOString() })
+          .eq('id', shot.id)
       }
     }
 
@@ -213,16 +301,7 @@ async function pollShots() {
       }
     }
 
-    // Check if shots are ready, trigger FFmpeg merge
-    // Face shots: only need omni done
-    const { data: faceShots } = await supabase
-      .from('movie_shots')
-      .select('*')
-      .eq('status', 'processing')
-      .eq('shot_type', 'face')
-      .not('omni_video_url', 'is', null)
-
-    // Scene shots: only need kling done
+    // Scene shots: trigger FFmpeg merge when Kling is done
     const { data: sceneShots } = await supabase
       .from('movie_shots')
       .select('*')
@@ -230,9 +309,7 @@ async function pollShots() {
       .eq('shot_type', 'scene')
       .not('kling_scene_url', 'is', null)
 
-    const readyShots = [...(faceShots ?? []), ...(sceneShots ?? [])]
-
-    for (const shot of readyShots) {
+    for (const shot of (sceneShots ?? [])) {
       // BUG 2: Permanently fail shots with too many retries
       if ((shot.retry_count ?? 0) >= MAX_RETRIES) {
         await supabase.from('movie_shots')
@@ -255,10 +332,8 @@ async function pollShots() {
         continue
       }
 
-      console.log('[worker] Ready for shot', shot.shot_index, 'type:', shot.shot_type, '- triggering FFmpeg merge')
+      console.log('[worker] Scene shot ready:', shot.shot_index, '- triggering FFmpeg merge')
 
-      // For face shots: merge omni video + kling audio
-      // For scene shots: use kling video directly
       try {
         const mergeRes = await fetchWithTimeout(
           RAILWAY_FFMPEG_URL + '/merge-videos',
@@ -266,7 +341,7 @@ async function pollShots() {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-              videoUrl: shot.shot_type === 'face' ? shot.omni_video_url : shot.kling_scene_url,
+              videoUrl: shot.kling_scene_url,
               audioUrl: shot.audio_url ?? null
             })
           },
@@ -277,10 +352,9 @@ async function pollShots() {
           await supabase.from('movie_shots')
             .update({ final_shot_url: mergeData.outputUrl, status: 'done', updated_at: new Date().toISOString() })
             .eq('id', shot.id)
-          console.log('[worker] Shot merged via FFmpeg:', shot.shot_index)
+          console.log('[worker] Scene shot merged via FFmpeg:', shot.shot_index)
         } else {
           console.error('[worker] FFmpeg merge no outputUrl:', JSON.stringify(mergeData))
-          // Reset to processing so it can be retried
           const newRetryCount = (shot.retry_count ?? 0) + 1
           await supabase.from('movie_shots')
             .update({ status: 'processing', retry_count: newRetryCount, updated_at: new Date().toISOString() })
@@ -288,7 +362,6 @@ async function pollShots() {
         }
       } catch (e) {
         console.error('[worker] FFmpeg merge error:', e.message)
-        // Reset to processing so it can be retried
         const newRetryCount = (shot.retry_count ?? 0) + 1
         await supabase.from('movie_shots')
           .update({ status: 'processing', retry_count: newRetryCount, updated_at: new Date().toISOString() })
@@ -407,11 +480,15 @@ async function pollShots() {
   }
 
   // BUG 7: Reset shots stuck in 'submitted' for >15 minutes
+  // Only reset shots that have NO kling_task_id (truly stuck with nothing submitted to PiAPI)
+  // Face shots with twin_frame_url are handled directly by FFmpeg - they also have no kling_task_id
+  // but they should be processed quickly; if stuck >15min, reset them too
   const fifteenMinutesAgo = new Date(Date.now() - 15 * 60 * 1000).toISOString()
   const { data: stuckSubmitted, error: stuckSubmittedErr } = await supabase
     .from('movie_shots')
     .select('id, shot_index, retry_count')
     .eq('status', 'submitted')
+    .is('kling_task_id', null)
     .lt('updated_at', fifteenMinutesAgo)
 
   if (stuckSubmitted && stuckSubmitted.length > 0) {
@@ -425,7 +502,7 @@ async function pollShots() {
         console.log('[worker] Stuck submitted shot permanently failed:', stuck.shot_index)
       } else {
         await supabase.from('movie_shots')
-          .update({ status: 'pending', omni_task_id: null, kling_task_id: null, retry_count: newRetry, updated_at: new Date().toISOString() })
+          .update({ status: 'pending', kling_task_id: null, retry_count: newRetry, updated_at: new Date().toISOString() })
           .eq('id', stuck.id)
         console.log('[worker] Reset stuck submitted shot:', stuck.shot_index, '(retry', newRetry, ')')
       }
@@ -473,3 +550,4 @@ async function main() {
 main()
 // redeploy Fri Apr 17 14:54:14 +07 2026
 // v3 Fri Apr 17 15:02:45 +07 2026
+// deploy Sat Apr 18 14:53:54 +07 2026
